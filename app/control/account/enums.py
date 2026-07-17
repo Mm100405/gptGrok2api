@@ -29,7 +29,7 @@ class FeedbackKind(StrEnum):
     SUCCESS      = "success"
     UNAUTHORIZED = "unauthorized"   # 401 — token invalid / expired
     FORBIDDEN    = "forbidden"      # 403 — account suspended / CF challenge
-    RATE_LIMITED = "rate_limited"   # 429 — quota exhausted
+    RATE_LIMITED = "rate_limited"   # 429 — quota or request-frequency limited
     SERVER_ERROR = "server_error"   # 5xx — upstream fault
     DISABLE      = "disable"        # operator-initiated disable
     DELETE       = "delete"         # operator-initiated delete

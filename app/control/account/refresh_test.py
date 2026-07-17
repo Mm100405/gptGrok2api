@@ -121,7 +121,7 @@ class AccountRefreshFastVerifyTest(unittest.IsolatedAsyncioTestCase):
 
         fetch.assert_awaited_once_with("verify-token", (1,))
 
-    async def test_console_429_never_marks_account_expired(self) -> None:
+    async def test_console_429_records_failure_without_zeroing_local_quota(self) -> None:
         service, repo = self._service()
         await service.record_failure_async(
             "verify-token",
@@ -133,8 +133,9 @@ class AccountRefreshFastVerifyTest(unittest.IsolatedAsyncioTestCase):
         patch = repo.patches[0]
         self.assertIsNone(patch.status)
         self.assertIsNone(patch.state_reason)
-        self.assertEqual(patch.quota_console["remaining"], 0)
-        self.assertEqual(patch.quota_console["source"], int(QuotaSource.ESTIMATED))
+        self.assertIsNone(patch.quota_console)
+        self.assertEqual(patch.usage_fail_delta, 1)
+        self.assertEqual(patch.last_fail_reason, "rate_limited")
 
     async def test_manual_refresh_failure_records_visible_metadata(self) -> None:
         service, repo = self._service()

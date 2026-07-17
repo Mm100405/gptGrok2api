@@ -279,7 +279,13 @@ class AccountDirectory:
                     fb.apply_success_quota(table, idx, mode_id)
 
             elif kind == FeedbackKind.RATE_LIMITED:
-                if strategy == "random":
+                if mode_id == 5 and strategy == "quota":
+                    # Console 429 is not authoritative evidence that this
+                    # account's local quota estimate is exhausted.  The
+                    # request loop already excludes it for the current retry;
+                    # only lower its health for future selections.
+                    fb.apply_rate_limited_transient(table, idx)
+                elif strategy == "random":
                     pool_id = int(table.pool_by_idx[idx])
                     cooling_sec = _pool_cooling_sec(pool_id, mode_id)
                     fb.apply_rate_limited_random(table, idx, cooling_sec=cooling_sec)

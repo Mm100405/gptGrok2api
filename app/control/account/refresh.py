@@ -576,41 +576,24 @@ class AccountRefreshService:
                     now = now_ms()
                     quota_patch: dict[str, dict] = {}
                     window = record.quota_set().get(mode_id)
-                    if window is not None:
-                        if mode_id == 5:
-                            # Console 429: 一次直接清零（扣 20），账号当前窗口不再可用
-                            # 立即启动恢复计时器，窗口结束后由巡检任务重置
-                            new_remaining = 0
-                            reset_at = window.reset_at
-                            if reset_at is None and window.window_seconds > 0:
-                                reset_at = now + window.window_seconds * 1000
-                            quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
-                                remaining=new_remaining,
-                                total=window.total,
-                                window_seconds=window.window_seconds,
-                                reset_at=reset_at,
-                                synced_at=window.synced_at,
-                                source=QuotaSource.ESTIMATED,
-                            ).to_dict()
-                            # Console 429 represents a temporary per-window
-                            # limit only.  Never promote it to EXPIRED: an
-                            # SSO is invalid only when an explicit credential
-                            # marker confirms that separately.
-                        else:
-                            # 非 console 模式保持原有清零逻辑
-                            reset_at = (
-                                window.reset_at
-                                if window.reset_at is not None and window.reset_at > now
-                                else now + max(window.window_seconds, 1) * 1000
-                            )
-                            quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
-                                remaining=0,
-                                total=window.total,
-                                window_seconds=window.window_seconds,
-                                reset_at=reset_at,
-                                synced_at=window.synced_at,
-                                source=QuotaSource.ESTIMATED,
-                            ).to_dict()
+                    # Console has no authoritative per-account quota endpoint.
+                    # A generic 429 can be caused by the shared team, proxy
+                    # exit, or request frequency, so only authoritative modes
+                    # are allowed to generate a zero-balance patch here.
+                    if window is not None and mode_id != 5:
+                        reset_at = (
+                            window.reset_at
+                            if window.reset_at is not None and window.reset_at > now
+                            else now + max(window.window_seconds, 1) * 1000
+                        )
+                        quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
+                            remaining=0,
+                            total=window.total,
+                            window_seconds=window.window_seconds,
+                            reset_at=reset_at,
+                            synced_at=window.synced_at,
+                            source=QuotaSource.ESTIMATED,
+                        ).to_dict()
                     await self._repo.patch_accounts(
                         [
                             AccountPatch(

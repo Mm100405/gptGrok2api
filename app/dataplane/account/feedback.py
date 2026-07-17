@@ -54,6 +54,11 @@ def apply_rate_limited_quota(
     _adjust_health(table, idx, _RATE_LIMIT_FACTOR)
 
 
+def apply_rate_limited_transient(table: AccountRuntimeTable, idx: int) -> None:
+    """Reduce health for a non-authoritative 429 without changing quota."""
+    _adjust_health(table, idx, _RATE_LIMIT_FACTOR)
+
+
 def apply_rate_limited_random(
     table: AccountRuntimeTable, idx: int, *, cooling_sec: int
 ) -> None:
@@ -173,6 +178,7 @@ __all__ = [
     "apply_success_quota",
     "apply_success_random",
     "apply_rate_limited_quota",
+    "apply_rate_limited_transient",
     "apply_rate_limited_random",
     "apply_auth_failure",
     "apply_forbidden",
