@@ -447,9 +447,13 @@ class XaiCliOAuthService:
             if isinstance(stored_account, dict):
                 self._update_protocol_job(job_id, stage="delivery", message="按配置投递 OAuth 凭据")
                 try:
+                    delivery_account = dict(stored_account)
+                    source_sso = _clean_text(source.get("sso") or source.get("sso_token"))
+                    if source_sso:
+                        delivery_account["sso_token"] = source_sso
                     delivery = await asyncio.to_thread(
                         deliver_xai_oauth_account,
-                        stored_account,
+                        delivery_account,
                         grok_config.get("oauth_delivery"),
                     )
                 except Exception as exc:

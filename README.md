@@ -28,7 +28,7 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | 外部系统接入 | 支持从 Sub2API、远程 CPA、本地 CPA 和 Access Token 导入账号；服务器部署提供 `gptgrok2api` Docker 网络别名。 |
 | 管理控制台 | 提供概览、GPT/Grok 账号管理、Grok Runtime、iCloud 邮箱、注册任务、Checkout 任务、代理管理、日志、实时监控、图片管理、调试中心和系统设置。 |
 | 存储与备份 | 账号数据支持 JSON、SQLite、PostgreSQL 和 Git 后端；图片支持本地与 WebDAV；备份支持本地归档和 R2。 |
-| 运维与发布 | 支持 Docker Compose、WARP 编排、内置 sidecar、Nginx HTTPS、运行日志、指标趋势、健康检查和自有版本更新源。 |
+| 运维与发布 | 支持 Docker Compose、WARP 编排、内置 sidecar、Nginx HTTPS、运行日志、指标趋势、健康检查和 GitHub Releases 更新源。 |
 
 ## iCloud Privacy Mail 模块
 
@@ -252,23 +252,21 @@ curl https://pro.muyuai.top/v1/models \
 
 ## 版本更新
 
-控制台从部署的更新服务器读取更新源：
+控制台统一从 GitHub 读取最新版本和更新日志：
 
 ```text
-https://pro.muyuai.top/updates/VERSION
-https://pro.muyuai.top/updates/CHANGELOG.md
+https://api.github.com/repos/AuuCoder/gptGrok2api/releases
+https://raw.githubusercontent.com/AuuCoder/gptGrok2api/main/CHANGELOG.md
 ```
-
-GitHub 仅用于打开项目发布页，不作为控制台版本号和更新日志的读取源。发布新版本时需先更新本地 `VERSION`、`CHANGELOG.md`，再同步到该更新服务器。
 
 工作方式：
 
 1. 当前运行版本由本机 `/version` 返回。
-2. 最新版本从自有更新源 `https://pro.muyuai.top/updates/VERSION` 读取。
-3. 更新日志从 `https://pro.muyuai.top/updates/CHANGELOG.md` 读取。
-4. 控制台比较版本号并显示更新状态。
+2. 最新版本从 GitHub Releases API 读取。
+3. 更新日志从 GitHub 仓库 `main` 分支的 `CHANGELOG.md` 读取。
+4. 后端缓存 GitHub 查询结果，控制台比较版本号并显示更新状态。
 
-发布新版本时需要同步修改根目录 `VERSION` 和 `CHANGELOG.md`，然后重新构建并部署更新源服务器。
+发布新版本时只需更新根目录 `VERSION` 和 `CHANGELOG.md`，推送版本标签并等待 GitHub Actions 完成，不再维护独立更新服务器。
 
 ## 本地开发
 

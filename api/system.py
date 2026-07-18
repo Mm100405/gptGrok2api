@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, Response, Streami
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.support import require_admin, require_identity, resolve_image_base_url
+from app.platform.update_check import get_latest_release_info
 from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
 from services.config import config
@@ -558,6 +559,10 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/version")
     async def get_version():
         return {"version": app_version}
+
+    @router.get("/meta/update", include_in_schema=False)
+    async def get_update_meta(force: bool = Query(False)):
+        return await get_latest_release_info(force=force)
 
     @router.get("/updates/VERSION", response_class=PlainTextResponse)
     async def get_update_version():

@@ -24,8 +24,6 @@ _PROXY_CREDENTIALS_RE = re.compile(
 PIX_BOOTSTRAP_COUNTRY = "BR"
 PIX_PROMOTION_COUNTRY = str(os.environ.get("PIX_PROMOTION_COUNTRY", "VN") or "VN").strip().upper() or "VN"
 PIX_PROVIDER_COUNTRY = "BR"
-PIX_MAX_AMOUNT_CENTS = max(0, int(os.environ.get("PIX_MAX_AMOUNT_CENTS", str(core.OPLL_FREE_TRIAL_MAX_MINOR_UNITS)) or core.OPLL_FREE_TRIAL_MAX_MINOR_UNITS))
-PIX_REQUIRE_ZERO = str(os.environ.get("PIX_REQUIRE_ZERO", "0")).strip().lower() in {"1", "true", "on", "yes"}
 PIX_REBUILD_ATTEMPTS = max(1, int(os.environ.get("PIX_REBUILD_ATTEMPTS", "5") or "5"))
 PIX_POLL_TIMEOUT_SECONDS = max(10, int(os.environ.get("PIX_POLL_TIMEOUT_SECONDS", "45") or "45"))
 PIX_FOLLOW_REDIRECT = str(os.environ.get("PIX_FOLLOW_REDIRECT", "1")).strip().lower() not in {"0", "false", "off", "no"}
@@ -73,12 +71,15 @@ def enforce_pix_amount(amount: Any, stage: str) -> int:
     amount_int = core.opll_amount_to_int(amount)
     if amount_int is None:
         raise RuntimeError(f"pix amount policy failed {stage}: amount={amount or 'missing'}")
-    if PIX_REQUIRE_ZERO and amount_int != 0:
-        raise RuntimeError(f"pix amount policy failed {stage}: amount={amount_int}, require_zero=1")
-    if amount_int > PIX_MAX_AMOUNT_CENTS:
-        raise RuntimeError(
-            f"pix amount policy failed {stage}: amount={amount_int}, allowed<={PIX_MAX_AMOUNT_CENTS}"
-        )
+    if amount_int != 0:
+        raise RuntimeError(f"pix amount policy failed {stage}: require zero, got {amount_int}")
+    return amount_int
+
+
+def enforce_original_price(amount: Any, stage: str) -> int:
+    amount_int = core.opll_amount_to_int(amount)
+    if amount_int is None or amount_int <= 0:
+        raise RuntimeError(f"original-price checkout missing at {stage}: amount={amount!r}")
     return amount_int
 
 
@@ -235,7 +236,7 @@ def _find_payment_method_types(payload: Any) -> list[str]:
 
 def ensure_pix_offered(init_payload: dict[str, Any], stage: str) -> list[str]:
     methods = _find_payment_method_types(init_payload)
-    if methods and "pix" not in methods:
+    if "pix" not in methods:
         raise RuntimeError(f"pix line unavailable at {stage}: methods={methods}")
     return methods
 
@@ -663,16 +664,12 @@ def resolve_pix_after_confirm(
     log_cb: LogCb = None,
 ) -> dict[str, Any]:
     cs_id = checkout["cs_id"]
-    details = extract_pix_details(confirm_payload)
-    if pix_details_has_link(details):
-        return enrich_with_redirect(stripe, details, log_cb)
     submission = core.opll_find_submission_attempt(confirm_payload)
     state = str(submission.get("state") or "").strip()
     if state == "failed":
         raise RuntimeError(f"PIX confirm submission failed: {core.opll_stripe_payload_diagnostics(confirm_payload, ctx)}")
-    if state == "requires_approval":
-        _log(log_cb, "[PIX] requires_approval → ChatGPT approve")
-        core.opll_chatgpt_approve_with_retry(access_token, cs_id, checkout, provider_proxy)
+    _log(log_cb, f"[PIX] confirm state={state or 'unknown'} → ChatGPT approve on original BR proxy")
+    core.opll_chatgpt_approve_with_retry(access_token, cs_id, checkout, provider_proxy)
     try:
         polled = poll_pix_payment_page(stripe, cs_id, stripe_pk, ctx, timeout_seconds=PIX_POLL_TIMEOUT_SECONDS)
         return enrich_with_redirect(stripe, polled, log_cb)
@@ -691,6 +688,14 @@ def run_pix_provider_attempt(
 ) -> dict[str, Any]:
     promotion_proxy = promotion_proxy or proxy_for_region(provider_proxy, PIX_PROMOTION_COUNTRY)
     provider_proxy = proxy_for_region(provider_proxy, PIX_PROVIDER_COUNTRY) if provider_proxy else provider_proxy
+    if not provider_proxy:
+        raise RuntimeError("PIX standalone requires the original BR provider proxy")
+    if not promotion_proxy:
+        raise RuntimeError(f"PIX standalone requires a {PIX_PROMOTION_COUNTRY} promotion proxy")
+    if promotion_proxy == provider_proxy:
+        raise RuntimeError(
+            f"PIX standalone requires a distinct {PIX_PROMOTION_COUNTRY} promotion proxy"
+        )
     _log(
         log_cb,
         f"[PIX] proxy chain: BR provider={provider_proxy or 'direct'}; "
@@ -716,67 +721,27 @@ def run_pix_provider_attempt(
     _log(log_cb, "[PIX] BR bootstrap Stripe init…")
     init_payload = stripe_init_pix(stripe, checkout["cs_id"], stripe_pk)
     bootstrap_amount, _ = core.opll_stripe_amount_info(init_payload)
-    bootstrap_methods = _find_payment_method_types(init_payload)
+    bootstrap_amount_int = enforce_original_price(bootstrap_amount, "BR original-price init")
+    bootstrap_methods = ensure_pix_offered(init_payload, "BR original-price init")
     _log(
         log_cb,
-        f"[PIX] bootstrap amount={bootstrap_amount} methods={bootstrap_methods or ['(empty)']} "
-        f"(PIX 可能在税务同步后才出现)",
+        f"[PIX] bootstrap original amount={bootstrap_amount_int} methods={bootstrap_methods}",
     )
 
-    # promotion 优先 VN；失败则回退 BR（bootstrap 金额已是 0 时仍可继续拿 PIX）
-    promo_candidates = []
-    for item in (promotion_proxy, provider_proxy):
-        item = str(item or "").strip()
-        if item and item not in promo_candidates:
-            promo_candidates.append(item)
-    if not promo_candidates:
-        promo_candidates = [""]
+    _log(log_cb, f"[PIX] checkout/update plus-1-month-free via {PIX_PROMOTION_COUNTRY} proxy…")
+    core.opll_update_checkout_promotion(access_token, checkout, promotion_proxy)
 
-    promo_used = promo_candidates[0]
-    last_promo_error = ""
-    for idx, candidate in enumerate(promo_candidates, start=1):
-        label = "VN/promo" if idx == 1 else "fallback"
-        _log(log_cb, f"[PIX] checkout/update promotion via {label} proxy…")
-        try:
-            core.opll_update_checkout_promotion(access_token, checkout, candidate)
-            promo_used = candidate
-            last_promo_error = ""
-            break
-        except Exception as exc:
-            last_promo_error = str(exc)
-            _log(log_cb, f"[PIX] promotion failed on {label}: {core.opll_short_error(last_promo_error, 180)}")
-            if idx >= len(promo_candidates):
-                # 金额已是 0 时允许跳过 update，继续税区同步
-                if core.opll_amount_to_int(bootstrap_amount) == 0:
-                    _log(log_cb, "[PIX] bootstrap amount already 0, skip checkout/update and continue taxes")
-                    promo_used = provider_proxy
-                    break
-                raise
-    if last_promo_error and core.opll_amount_to_int(bootstrap_amount) != 0 and promo_used == promo_candidates[-1]:
-        raise RuntimeError(f"checkout/update failed: {last_promo_error}")
-
-    _log(log_cb, "[PIX] BR taxes + tax_region…")
-    tax_proxy = provider_proxy or promo_used
-    try:
-        update_pix_checkout_taxes(access_token, checkout, billing, tax_proxy)
-    except Exception as exc:
-        if tax_proxy != promo_used and promo_used:
-            _log(log_cb, f"[PIX] taxes on provider failed, retry promo proxy: {core.opll_short_error(str(exc), 120)}")
-            update_pix_checkout_taxes(access_token, checkout, billing, promo_used)
-            tax_proxy = promo_used
-        else:
-            raise
-    tax_stripe = core.opll_build_stripe_session(tax_proxy)
+    _log(log_cb, "[PIX] return to original BR proxy for taxes + tax_region…")
+    update_pix_checkout_taxes(access_token, checkout, billing, provider_proxy)
+    tax_stripe = core.opll_build_stripe_session(provider_proxy)
     stripe_update_tax_region(tax_stripe, checkout["cs_id"], stripe_pk, billing)
 
-    _log(log_cb, "[PIX] BR final Stripe init + amount check…")
+    _log(log_cb, "[PIX] original BR Stripe init: verify amount=0 and PIX still offered…")
     init_payload = stripe_init_pix(stripe, checkout["cs_id"], stripe_pk)
     stripe_amount, stripe_amount_source = core.opll_stripe_amount_info(init_payload)
-    amount_int = enforce_pix_amount(stripe_amount, "after BR tax sync")
-    methods = _find_payment_method_types(init_payload)
-    _log(log_cb, f"[PIX] final amount={amount_int} source={stripe_amount_source} methods={methods or ['(empty)']}")
-    if methods and "pix" not in methods:
-        raise RuntimeError(f"pix line unavailable at final init: methods={methods}")
+    amount_int = enforce_pix_amount(stripe_amount, "original BR final init")
+    methods = ensure_pix_offered(init_payload, "original BR final init")
+    _log(log_cb, f"[PIX] final amount={amount_int} source={stripe_amount_source} methods={methods}")
 
     stripe_hosted_url = str(init_payload.get("stripe_hosted_url") or "").strip()
     ctx = core.opll_stripe_context(init_payload, payment_locale="pt-BR")

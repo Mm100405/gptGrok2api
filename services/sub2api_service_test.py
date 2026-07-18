@@ -146,7 +146,7 @@ class Sub2APIAccountSyncTest(unittest.TestCase):
         self.assertNotIn("access-token-must-not-leak", message)
         self.assertNotIn("refresh-token-must-not-leak", message)
 
-    def test_sync_xai_oauth_uses_xai_platform_and_credentials(self) -> None:
+    def test_sync_xai_oauth_uses_grok_platform_and_cli_credentials(self) -> None:
         session = MagicMock()
         session.post.return_value = _Response(201, {"data": {"id": "remote-xai-account"}})
         sync_config = sub2api_service.normalize_sync_config({
@@ -158,6 +158,7 @@ class Sub2APIAccountSyncTest(unittest.TestCase):
             **self._account(),
             "subject": "xai-principal-one",
             "token_type": "Bearer",
+            "sso_token": "sso-session-must-not-leak",
         }
 
         with patch("services.sub2api_service.Session", return_value=session):
@@ -167,14 +168,21 @@ class Sub2APIAccountSyncTest(unittest.TestCase):
         self.assertEqual(result["account_id"], "remote-xai-account")
         account_call = self._post_call_for(session, "/api/v1/admin/accounts")
         payload = account_call.kwargs["json"]
-        self.assertEqual(payload["platform"], "xai")
+        self.assertEqual(payload["platform"], "grok")
         self.assertEqual(payload["type"], "oauth")
         self.assertEqual(payload["group_ids"], [52])
         self.assertEqual(payload["credentials"]["subject"], "xai-principal-one")
         self.assertEqual(payload["credentials"]["sub"], "xai-principal-one")
+        self.assertEqual(
+            payload["credentials"]["client_id"],
+            sub2api_service.XAI_OAUTH_CLIENT_ID,
+        )
+        self.assertEqual(payload["credentials"]["scope"], sub2api_service.XAI_OAUTH_SCOPE)
+        self.assertEqual(payload["credentials"]["base_url"], sub2api_service.XAI_CLI_BASE_URL)
+        self.assertEqual(payload["credentials"]["sso_token"], "sso-session-must-not-leak")
         self.assertNotIn("new-account@example.test", account_call.kwargs["headers"]["Idempotency-Key"])
 
-    def test_sync_xai_custom_group_is_created_for_xai_platform(self) -> None:
+    def test_sync_xai_custom_group_is_created_for_grok_platform(self) -> None:
         session = MagicMock()
         session.get.return_value = _Response(200, {"data": {"items": [], "total": 0}})
         session.post.side_effect = [
@@ -192,7 +200,7 @@ class Sub2APIAccountSyncTest(unittest.TestCase):
             sub2api_service.sync_xai_oauth_account(self._server(), self._account(), sync_config)
 
         group_call = self._post_call_for(session, "/api/v1/admin/groups")
-        self.assertEqual(group_call.kwargs["json"]["platform"], "xai")
+        self.assertEqual(group_call.kwargs["json"]["platform"], "grok")
 
 
 class Sub2APITLSVerificationTest(unittest.TestCase):

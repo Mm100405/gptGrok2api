@@ -177,6 +177,64 @@ class CloudflareTempMailProviderTest(unittest.TestCase):
         self.assertEqual(session.request.call_count, 1)
 
 
+class MailProviderSelectionTest(unittest.TestCase):
+    def test_next_entry_skips_excluded_provider_ref(self) -> None:
+        mail_config = {
+            "providers": [
+                {
+                    "id": "cf",
+                    "enable": True,
+                    "type": "cloudflare_temp_email",
+                },
+                {
+                    "id": "primary",
+                    "enable": True,
+                    "type": "icloud_local",
+                },
+            ]
+        }
+
+        entry = mail_provider._next_entry(
+            mail_config,
+            {"cloudflare_temp_email:cf"},
+        )
+
+        self.assertEqual(entry["provider_ref"], "icloud_local:primary")
+
+    def test_wait_timeout_override_is_limited_to_current_provider(self) -> None:
+        mail_config = {
+            "wait_timeout": 180,
+            "providers": [
+                {
+                    "id": "cf",
+                    "enable": True,
+                    "type": "cloudflare_temp_email",
+                }
+            ],
+        }
+        mailbox = {
+            "provider": "cloudflare_temp_email",
+            "provider_ref": "cloudflare_temp_email:cf",
+            "address": "cf@example.test",
+        }
+        provider = MagicMock()
+        provider.conf = {"wait_timeout": 180, "wait_interval": 2}
+        provider.wait_for_code.return_value = "123456"
+
+        with patch.object(mail_provider, "_create_provider", return_value=provider):
+            code = mail_provider.wait_for_code(
+                mail_config,
+                mailbox,
+                wait_timeout=60,
+            )
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(provider.conf["wait_timeout"], 60.0)
+        self.assertEqual(mail_config["wait_timeout"], 180)
+        provider.wait_for_code.assert_called_once_with(mailbox)
+        provider.close.assert_called_once_with()
+
+
 class ICloudPrivacyMailProviderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.entry = {
@@ -532,6 +590,121 @@ class ICloudPrivacyMailProviderTest(unittest.TestCase):
         session_conf = create_session.call_args.args[0]
         self.assertEqual(session_conf["proxy"], "direct")
         self.assertEqual(self.conf, original_conf)
+
+
+class OutlookTokenProviderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conf = {
+            "request_timeout": 7,
+            "wait_timeout": 1,
+            "wait_interval": 0.001,
+            "user_agent": "mail-provider-test",
+            "proxy": "direct",
+        }
+        self.entry = {
+            "type": "outlook_token",
+            "provider_ref": "outlook_token:test",
+            "mode": "auto",
+            "mailboxes": "person@outlook.com----password----client-id----refresh-token",
+        }
+
+    def _provider(self) -> mail_provider.OutlookTokenProvider:
+        with patch.object(mail_provider, "_create_session", return_value=MagicMock()):
+            return mail_provider.OutlookTokenProvider(dict(self.entry), dict(self.conf))
+
+    def test_auto_mode_falls_back_to_imap_when_graph_scope_is_unavailable(self) -> None:
+        provider = self._provider()
+        mailbox = {
+            "address": "person@outlook.com",
+            "login_email": "person@outlook.com",
+            "client_id": "client-id",
+            "refresh_token": "refresh-token",
+        }
+
+        def access_token(_mailbox, _client_id, _refresh_token, scope):
+            if scope == mail_provider.OUTLOOK_GRAPH_SCOPE:
+                raise mail_provider.OutlookTokenError(
+                    "OutlookToken 刷新失败: HTTP 400, AADSTS70000: requested scope unauthorized"
+                )
+            return "imap-access-token"
+
+        with (
+            patch.object(provider, "_access_token", side_effect=access_token) as get_access_token,
+            patch.object(provider, "_imap_messages", return_value=[{"subject": "mail"}]) as imap_messages,
+        ):
+            first_messages = provider.fetch_recent_messages(mailbox)
+            second_messages = provider.fetch_recent_messages(mailbox)
+
+        self.assertEqual(first_messages, [{"subject": "mail"}])
+        self.assertEqual(second_messages, [{"subject": "mail"}])
+        scopes = [call.args[3] for call in get_access_token.call_args_list]
+        self.assertEqual(scopes.count(mail_provider.OUTLOOK_GRAPH_SCOPE), 1)
+        self.assertEqual(scopes.count(mail_provider.OUTLOOK_IMAP_SCOPE), 2)
+        self.assertEqual(imap_messages.call_count, 2)
+
+    def test_client_request_loop_is_treated_as_temporary_rate_limit(self) -> None:
+        self.assertTrue(
+            mail_provider._is_outlook_token_rate_limited(
+                400,
+                "AADSTS50196: The server encountered a client request loop",
+            )
+        )
+
+    def test_client_request_loop_does_not_retry_token_exchange(self) -> None:
+        provider = self._provider()
+        response = MagicMock()
+        response.status_code = 400
+        response.text = "AADSTS50196"
+        response.json.return_value = {
+            "error_description": "AADSTS50196: The server encountered a client request loop"
+        }
+        provider.session.post.return_value = response
+
+        with self.assertRaises(mail_provider.OutlookTokenRateLimitError):
+            provider._exchange_refresh_token(
+                "client-id",
+                "refresh-token",
+                mail_provider.OUTLOOK_GRAPH_SCOPE,
+            )
+
+        provider.session.post.assert_called_once()
+
+    def test_imap_connection_uses_configured_request_timeout(self) -> None:
+        provider = self._provider()
+        mailbox = {"address": "person@outlook.com", "login_email": "person@outlook.com"}
+        imap = MagicMock()
+        imap.authenticate.return_value = ("OK", [])
+        imap.select.return_value = ("OK", [])
+        imap.uid.return_value = ("OK", [b""])
+
+        with patch.object(mail_provider.imaplib, "IMAP4_SSL", return_value=imap) as imap_type:
+            messages = provider._imap_messages(mailbox, "access-token")
+
+        self.assertEqual(messages, [])
+        imap_type.assert_called_once_with("outlook.office365.com", timeout=7.0)
+
+    def test_wait_for_code_retries_a_transient_imap_timeout(self) -> None:
+        provider = self._provider()
+        mailbox = {"address": "person@outlook.com"}
+        message = {
+            "provider": "outlook_token",
+            "mailbox": "person@outlook.com",
+            "message_id": "message-1",
+            "subject": "Your verification code is 654321",
+            "to": "person@outlook.com",
+            "text_content": "Verification code: 654321",
+            "received_at": datetime.now(timezone.utc),
+        }
+
+        with patch.object(
+            provider,
+            "fetch_recent_messages",
+            side_effect=[TimeoutError("IMAP read timed out"), [message]],
+        ) as fetch:
+            code = provider.wait_for_code(mailbox)
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(fetch.call_count, 2)
 
 
 if __name__ == "__main__":

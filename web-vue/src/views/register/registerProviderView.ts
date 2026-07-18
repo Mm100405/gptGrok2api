@@ -105,9 +105,9 @@ export const gptMailKeyModeOptions = [
 export const gptMailKeyModeGroups = [{ options: gptMailKeyModeOptions }]
 
 export const outlookModeOptions = [
-  { value: 'graph', label: 'Graph API' },
-  { value: 'imap', label: 'IMAP' },
-  { value: 'auto', label: '自动兜底' },
+  { value: 'auto', label: '自动兼容（推荐）' },
+  { value: 'imap', label: 'IMAP（旧 Token）' },
+  { value: 'graph', label: 'Graph API（Graph 授权）' },
 ] as const
 
 export const outlookModeGroups = [{ options: outlookModeOptions }]

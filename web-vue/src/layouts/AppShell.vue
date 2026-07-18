@@ -558,11 +558,7 @@ import { versionApi } from '@/api/version'
 import { getAuthToken } from '@/api/client'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
-import {
-  projectChangelogUrl,
-  projectReleasePageUrl,
-  projectVersionUrl,
-} from '@/config/project'
+import { projectReleasePageUrl } from '@/config/project'
 import { useModelCatalog } from '@/composables/useModelCatalog'
 import { Button, ValueSurface } from 'nanocat-ui'
 import ConfirmDialog from '@/components/ui/AppConfirmDialog.vue'
@@ -848,9 +844,7 @@ let stopRoutePendingAfterEach: (() => void) | null = null
 let stopRoutePendingError: (() => void) | null = null
 const prefetchedRoutePaths = new Set<string>()
 const releasePageUrl = projectReleasePageUrl
-const latestVersionUrl = projectVersionUrl
-const latestChangelogUrl = projectChangelogUrl
-const updateCheckingMessage = '正在检查云端版本...'
+const updateCheckingMessage = '正在从 GitHub 检查版本...'
 const routeViewLoaders: Record<string, () => Promise<unknown>> = {
   '/': () => import('@/views/Dashboard.vue'),
   '/accounts': () => import('@/views/Accounts.vue'),
@@ -977,12 +971,12 @@ async function checkForUpdates(showMessage = true) {
   isCheckingUpdate.value = true
   updateCheckMessage.value = updateCheckingMessage
   try {
-    const [version, changelog] = await Promise.all([
-      fetchRemoteText(latestVersionUrl),
-      fetchRemoteText(latestChangelogUrl),
-    ])
-    latestVersionTag.value = normalizeVersionTag(version)
-    const remoteReleases = parseChangelog(changelog)
+    const result = await versionApi.check(showMessage)
+    if (result.check_error) throw new Error(result.check_error)
+    if (result.tag) currentVersionTag.value = result.tag
+    if (!result.latest_tag && !result.latest_version) throw new Error('GitHub 未返回有效版本')
+    latestVersionTag.value = normalizeVersionTag(result.latest_tag || result.latest_version)
+    const remoteReleases = parseChangelog(result.changelog || '')
     if (remoteReleases.length) {
       releaseEntries.value = remoteReleases
     }
@@ -995,25 +989,12 @@ async function checkForUpdates(showMessage = true) {
       else toast.success(message)
     }
   } catch (error: any) {
-    updateCheckMessage.value = '云端版本检查失败，当前展示本地更新日志。'
+    updateCheckMessage.value = 'GitHub 版本检查失败，当前展示本地更新日志。'
     if (showMessage) {
-      const detail = error?.name === 'AbortError' ? '云端版本检查超时' : error?.message
-      toast.warning(detail || '云端版本检查失败')
+      toast.warning(error?.message || 'GitHub 版本检查失败')
     }
   } finally {
     isCheckingUpdate.value = false
-  }
-}
-
-async function fetchRemoteText(url: string) {
-  const controller = new AbortController()
-  const timeoutId = window.setTimeout(() => controller.abort(), 8000)
-  try {
-    const response = await fetch(url, { cache: 'no-store', signal: controller.signal })
-    if (!response.ok) throw new Error(`云端返回 ${response.status}`)
-    return response.text()
-  } finally {
-    window.clearTimeout(timeoutId)
   }
 }
 

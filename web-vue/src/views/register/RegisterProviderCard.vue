@@ -418,7 +418,7 @@
         <label class="register-field">
           <span class="register-label">读取方式</span>
           <GroupedSelectMenu
-            :model-value="provider.mode"
+            :model-value="provider.mode || 'auto'"
             :groups="outlookModeGroups"
             selected-indicator="none"
             :disabled="disabled"
@@ -427,7 +427,7 @@
           />
         </label>
 
-        <label v-if="provider.mode !== 'graph'" class="register-field">
+        <label class="register-field">
           <span class="register-label">IMAP Host</span>
           <Input
             :model-value="provider.imap_host"

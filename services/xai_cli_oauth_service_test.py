@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -118,6 +118,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             "id": "grok-delivery-source",
             "email": "delivery@example.com",
             "password": "source-password",
+            "sso": "delivery-sso",
         }
         credential = {
             "access_token": _jwt({"sub": "delivery-subject", "email": "delivery@example.com", "exp": int(time.time()) + 3600}),
@@ -131,6 +132,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             "cpa": {"status": "failed", "target_id": "pool-one", "at": "2030-01-01T00:00:00+00:00", "error": "HTTP 503"},
         }
 
+        delivery_mock = MagicMock(return_value=delivery)
         with patch.object(self.service, "_select_protocol_source_account", return_value=source), patch(
             "services.register_service.register_service.get",
             return_value={"grok": {"oauth_delivery": {}}, "proxy": "direct"},
@@ -143,7 +145,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=["grok-4.5"]),
         ), patch(
             "services.xai_oauth_delivery_service.deliver_xai_oauth_account",
-            return_value=delivery,
+            delivery_mock,
         ):
             started = await self.service.start_protocol_authorization("grok-delivery-source")
             job_id = started["job"]["id"]
@@ -159,6 +161,9 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         account = self.store.list_accounts(redacted=False)[0]
         self.assertEqual(account["metadata"]["oauth_delivery"], delivery)
         self.assertNotIn("delivery-refresh", repr(job))
+        delivered_account = delivery_mock.call_args.args[0]
+        self.assertEqual(delivered_account["sso_token"], "delivery-sso")
+        self.assertNotIn("sso_token", account)
 
     async def test_background_protocol_entry_runs_to_terminal_state(self) -> None:
         source = {"id": "grok-background", "email": "background@example.com", "password": "password"}

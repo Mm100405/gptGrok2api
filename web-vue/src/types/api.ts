@@ -346,6 +346,10 @@ export interface VersionCheckResponse extends VersionInfoResponse {
   latest_tag: string
   latest_version: string
   release_url: string
+  release_name?: string
+  release_notes?: string
+  changelog?: string
+  published_at?: string
   is_latest: boolean
   update_available: boolean
   check_error?: string

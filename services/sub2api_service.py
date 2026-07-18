@@ -16,6 +16,7 @@ from curl_cffi.requests import Session
 from services.account_service import account_service
 from services.config import DATA_DIR, config
 from services.json_file import read_json_file, write_json_file
+from services.xai_cli_oauth_protocol import XAI_CLI_BASE_URL, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_SCOPE
 
 
 SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
@@ -826,6 +827,9 @@ def _xai_sync_credentials(account: dict) -> dict[str, str]:
     credentials = {
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "client_id": XAI_OAUTH_CLIENT_ID,
+        "scope": XAI_OAUTH_SCOPE,
+        "base_url": XAI_CLI_BASE_URL,
     }
     for source_key, target_key in (
         ("id_token", "id_token"),
@@ -840,6 +844,11 @@ def _xai_sync_credentials(account: dict) -> dict[str, str]:
     expires_at = _clean(account.get("expires_at") or account.get("expired"))
     if expires_at:
         credentials["expires_at"] = expires_at
+    sso_token = _clean(account.get("sso_token") or account.get("sso"))
+    if sso_token.lower().startswith("sso="):
+        sso_token = sso_token[4:].split(";", 1)[0].strip()
+    if sso_token:
+        credentials["sso_token"] = sso_token
     return credentials
 
 
@@ -929,7 +938,7 @@ def sync_openai_account(server: dict, account: dict, sync_config: object) -> dic
 
 
 def sync_xai_oauth_account(server: dict, account: dict, sync_config: object) -> dict:
-    """Push one locally saved xAI OAuth credential to a Sub2API xAI group."""
+    """Push one locally saved xAI OAuth credential to a Sub2API Grok group."""
     settings = normalize_sync_config(sync_config)
     if not settings["enabled"]:
         return {"ok": False, "skipped": True, "reason": "disabled"}
@@ -944,7 +953,7 @@ def sync_xai_oauth_account(server: dict, account: dict, sync_config: object) -> 
     if not base_url:
         raise Sub2APISyncError("Sub2API 连接缺少地址")
     credentials = _xai_sync_credentials(account)
-    group_id, group_name = _resolve_sync_group(server, settings, platform="xai")
+    group_id, group_name = _resolve_sync_group(server, settings, platform="grok")
     account_name = _clean(account.get("email")) or _clean(account.get("subject")) or "xAI OAuth Account"
 
     session = None
@@ -960,7 +969,7 @@ def sync_xai_oauth_account(server: dict, account: dict, sync_config: object) -> 
             headers=headers,
             json={
                 "name": account_name,
-                "platform": "xai",
+                "platform": "grok",
                 "type": "oauth",
                 "credentials": credentials,
                 "extra": {

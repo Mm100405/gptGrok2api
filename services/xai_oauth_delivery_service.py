@@ -59,7 +59,7 @@ def normalize_xai_oauth_delivery_config(raw: object) -> dict[str, dict[str, Any]
 
 def _safe_error(error: BaseException, account: dict) -> str:
     message = _clean(error) or type(error).__name__
-    for key in ("access_token", "refresh_token", "id_token", "email", "subject"):
+    for key in ("access_token", "refresh_token", "id_token", "sso", "sso_token", "email", "subject"):
         secret = _clean(account.get(key))
         if secret:
             message = message.replace(secret, "[redacted]")

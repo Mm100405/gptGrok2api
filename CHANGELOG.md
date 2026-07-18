@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.3 - 2026-07-18
+
++ [修复] 更新中心的最新版本与更新日志统一从 GitHub Releases 和仓库读取，不再依赖独立更新服务器，手动检查会强制刷新 GitHub 缓存。
++ [修复] Outlook 旧版 IMAP OAuth Token 自动兼容 Graph 权限差异，缓存不可用通道并重试瞬时 IMAP 超时，避免重复刷新触发 `AADSTS50196` 或误判 Token 失效。
++ [优化] ChatGPT 注册邮箱等待保留真实 provider 错误；CF 邮箱短窗口重发一次后自动切换其他已启用邮箱来源，避免任务长期卡在无邮件状态。
++ [优化] 注册配置全面改为自动保存，离开页面不再丢失邮箱、Checkout、Sub2API 和 OAuth 投递设置；启动任务前会等待最新修改保存完成。
++ [修复] Grok OAuth 同步到 Sub2API 时使用 Grok 平台字段并补齐 CLI OAuth 元数据与 SSO，远程投递错误继续执行敏感字段脱敏。
++ [修复] Pix 方案 3 固定执行 BR 原价校验、VN 优惠注入、BR 税区与零金额 PIX 校验，并始终在原 BR 出口执行 Approve 与轮询。
++ [文档] 补充 iCloud Privacy Mail 对外 API 地址和本机 `8788` 端口配置说明。
+
 ## 1.0.2 - 2026-07-17
 
 + [新增] Grok 4.5 OAuth 账号支持按配置独立投递到 Sub2API 和 CPA；凭据始终先保存到本地，远程失败不影响授权结果。

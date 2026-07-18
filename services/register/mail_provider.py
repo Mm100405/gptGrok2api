@@ -815,6 +815,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
+        self.label = str(entry.get("label") or "CF临时邮箱").strip()
         self.code_keyword = str(entry.get("keyword") or "").strip()
         self.require_code_context = bool(self.code_keyword)
         self.session = _create_session(conf)
@@ -831,7 +832,13 @@ class CloudflareTempMailProvider(BaseMailProvider):
         token = str(data.get("jwt") or "").strip()
         if not address or not token:
             raise RuntimeError("CloudflareTempMail 缺少 address 或 jwt")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "token": token,
+            "label": self.label,
+        }
 
     def get_existing_mailbox(self, email: str) -> dict[str, Any]:
         """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
@@ -1987,6 +1994,35 @@ def _is_outlook_scope_denied(error: Exception | str) -> bool:
     )
 
 
+def _is_outlook_request_loop(error: Exception | str) -> bool:
+    text = str(error or "").lower()
+    return "aadsts50196" in text or "client request loop" in text
+
+
+def _is_outlook_graph_unavailable(error: Exception | str) -> bool:
+    return _is_outlook_scope_denied(error) or _is_outlook_request_loop(error)
+
+
+def _is_outlook_transient_fetch_error(error: Exception | str) -> bool:
+    if isinstance(error, (TimeoutError, imaplib.IMAP4.abort)):
+        return True
+    if isinstance(error, OSError) and not isinstance(error, imaplib.IMAP4.error):
+        return True
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection closed",
+            "connection aborted",
+            "socket error",
+            "eof",
+        )
+    )
+
+
 class OutlookTokenError(RuntimeError):
     """refresh_token 换取 access_token 失败（凭据失效/权限不对），与“读邮件失败”区分。"""
 
@@ -2169,7 +2205,13 @@ def expand_outlook_aliases(credentials: list[dict[str, str]], entry: dict | None
 
 def _is_outlook_token_rate_limited(status_code: int, detail: str) -> bool:
     text = str(detail or "").lower()
-    return status_code == 429 or "aadsts90055" in text or "excessive request rate" in text
+    return (
+        status_code == 429
+        or "aadsts90055" in text
+        or "excessive request rate" in text
+        or "aadsts50196" in text
+        or "client request loop" in text
+    )
 
 
 def _retry_after_seconds(resp: Any, fallback: float) -> float:
@@ -2264,6 +2306,10 @@ class OutlookTokenProvider(BaseMailProvider):
             detail = str(data.get("error_description") or data.get("error") or resp.text[:300])
             last_detail = detail
             last_status = int(resp.status_code)
+            if _is_outlook_request_loop(detail):
+                raise OutlookTokenRateLimitError(
+                    f"OutlookToken 刷新被 Microsoft 暂时限制: HTTP {last_status}, {detail}"
+                )
             if _is_outlook_token_rate_limited(last_status, detail) and attempt < max_attempts - 1:
                 delay = _retry_after_seconds(resp, 1.5 * (attempt + 1) + random.uniform(0.5, 1.5))
                 time.sleep(delay)
@@ -2375,7 +2421,10 @@ class OutlookTokenProvider(BaseMailProvider):
     def _imap_messages(self, mailbox: dict[str, Any], access_token: str) -> list[dict[str, Any]]:
         """返回最近 N 封邮件，最新在前。"""
         auth_string = f"user={mailbox.get('login_email') or mailbox['address']}\x01auth=Bearer {access_token}\x01\x01"
-        imap = imaplib.IMAP4_SSL(self.imap_host)
+        imap = imaplib.IMAP4_SSL(
+            self.imap_host,
+            timeout=max(1.0, float(self.conf["request_timeout"])),
+        )
         try:
             imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
             status, _ = imap.select("INBOX", readonly=True)
@@ -2468,18 +2517,24 @@ class OutlookTokenProvider(BaseMailProvider):
         if not client_id or not refresh_token:
             raise RuntimeError("OutlookToken mailbox 缺少 client_id 或 refresh_token")
         errors: list[str] = []
-        graph_error: Exception | None = None
-        if self.mode in {"graph", "auto"}:
+        graph_unavailable = bool(mailbox.get("_outlook_graph_unavailable"))
+        if self.mode in {"graph", "auto"} and not graph_unavailable:
             try:
                 access_token = self._access_token(mailbox, client_id, refresh_token, OUTLOOK_GRAPH_SCOPE)
                 return self._graph_messages(mailbox, access_token)
             except Exception as error:
-                graph_error = error
-                if self.mode == "graph" and not _is_outlook_scope_denied(error):
+                if _is_outlook_graph_unavailable(error):
+                    graph_unavailable = True
+                    mailbox["_outlook_graph_unavailable"] = True
+                elif self.mode == "graph":
                     raise
-                errors.append(f"graph: {error}")
+                # Older Outlook refresh tokens are commonly IMAP-only. Graph
+                # scope rejection and temporary request-loop protection are
+                # compatibility branches, not proof that the token is invalid.
+                if not graph_unavailable:
+                    errors.append(f"graph: {error}")
         should_try_imap = self.mode in {"imap", "auto"} or (
-            self.mode == "graph" and graph_error is not None and _is_outlook_scope_denied(graph_error)
+            self.mode == "graph" and graph_unavailable
         )
         if should_try_imap:
             try:
@@ -2509,8 +2564,20 @@ class OutlookTokenProvider(BaseMailProvider):
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
         target_address = str(mailbox.get("address") or "").strip()
+        last_transient_error: Exception | None = None
+        successful_reads = 0
         while time.monotonic() < deadline:
-            for message in self.fetch_recent_messages(mailbox):
+            try:
+                messages = self.fetch_recent_messages(mailbox)
+                successful_reads += 1
+                last_transient_error = None
+            except Exception as error:
+                if not _is_outlook_transient_fetch_error(error):
+                    raise
+                last_transient_error = error
+                time.sleep(max(0.2, self.conf["wait_interval"]))
+                continue
+            for message in messages:
                 if _message_before_code_boundary(mailbox, message):
                     continue
                 if target_address and not _message_matches_email(message, target_address):
@@ -2536,6 +2603,8 @@ class OutlookTokenProvider(BaseMailProvider):
                     return code
                 seen_refs.add(ref)
             time.sleep(max(0.2, self.conf["wait_interval"]))
+        if last_transient_error is not None and successful_reads == 0:
+            raise RuntimeError(f"OutlookToken 邮箱查询持续失败: {last_transient_error}") from last_transient_error
         return None
 
 
@@ -2561,9 +2630,12 @@ def _enabled_entries(mail_config: dict) -> list[dict]:
     return items
 
 
-def _next_entry(mail_config: dict) -> dict:
+def _next_entry(mail_config: dict, excluded_provider_refs: set[str] | None = None) -> dict:
     global provider_index
-    items = _enabled_entries(mail_config)
+    excluded = {str(item or "").strip() for item in (excluded_provider_refs or set()) if str(item or "").strip()}
+    items = [item for item in _enabled_entries(mail_config) if str(item.get("provider_ref") or "").strip() not in excluded]
+    if not items:
+        raise RuntimeError("没有剩余可用的邮箱提供商")
     if len(items) == 1:
         return dict(items[0])
     with provider_lock:
@@ -2572,9 +2644,18 @@ def _next_entry(mail_config: dict) -> dict:
         return value
 
 
-def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
+def _create_provider(
+    mail_config: dict,
+    provider: str = "",
+    provider_ref: str = "",
+    excluded_provider_refs: set[str] | None = None,
+) -> BaseMailProvider:
     entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
-    entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
+    entry = (
+        entry
+        or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None)
+        or _next_entry(mail_config, excluded_provider_refs)
+    )
     conf = _config(mail_config)
     if entry["type"] == "cloudmail_gen":
         return CloudMailGenProvider(entry, conf)
@@ -2603,12 +2684,19 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
-def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
-    enabled = _enabled_entries(mail_config)
+def create_mailbox(
+    mail_config: dict,
+    username: str | None = None,
+    excluded_provider_refs: set[str] | None = None,
+) -> dict:
+    excluded = {str(item or "").strip() for item in (excluded_provider_refs or set()) if str(item or "").strip()}
+    enabled = [item for item in _enabled_entries(mail_config) if str(item.get("provider_ref") or "").strip() not in excluded]
+    if not enabled:
+        raise RuntimeError("没有剩余可用的邮箱提供商")
     tried: set[str] = set()
     last_error = ""
     for _ in range(len(enabled)):
-        provider = _create_provider(mail_config)
+        provider = _create_provider(mail_config, excluded_provider_refs=excluded)
         provider_key = f"{provider.name}#{provider.provider_ref}"
         try:
             if provider_key in tried:
@@ -2650,9 +2738,11 @@ def sync_icloud_claims(mail_config: dict, project: str, emails: list[str]) -> di
         provider.close()
 
 
-def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
+def wait_for_code(mail_config: dict, mailbox: dict, *, wait_timeout: float | None = None) -> str | None:
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
+        if wait_timeout is not None:
+            provider.conf = {**provider.conf, "wait_timeout": max(1.0, float(wait_timeout))}
         return provider.wait_for_code(mailbox)
     finally:
         provider.close()

@@ -6,14 +6,9 @@
           <StateBadge :tone="registerConfig?.enabled ? 'success' : 'muted'" shape="rounded" size="sm">
             {{ registerConfig?.enabled ? '运行中' : '未启动' }}
           </StateBadge>
-          <Button
-            size="sm"
-            variant="primary"
-            :disabled="legacySaving || !registerConfig || registerConfig.enabled"
-            @click="saveLegacyConfig"
-          >
-            保存配置
-          </Button>
+          <MetaChip v-if="registerConfig" size="sm" :tone="autosaveTone" :title="autosaveMessage">
+            {{ autosaveLabel }}
+          </MetaChip>
         </template>
       </PanelHeader>
 
@@ -28,10 +23,6 @@
           <div class="register-config-column">
             <RegisterTaskSettingsPanel
               :config="registerConfig"
-              :checkout-saving="legacySaving"
-              :sub2api-sync-saving="sub2apiSyncSaving"
-              :sub2api-sync-save-status="sub2apiSyncSaveStatus"
-              :sub2api-sync-save-message="sub2apiSyncSaveMessage"
               :proxy-mode="registerProxyMode"
               :selected-proxy-group-id="selectedRegisterProxyGroupId"
               :custom-proxy-input="customRegisterProxyInput"
@@ -41,9 +32,6 @@
               @update-proxy-mode="setRegisterProxyMode"
               @select-proxy-group="selectRegisterProxyGroup"
               @update-custom-proxy="setCustomRegisterProxyInput"
-              @save-checkout="saveLegacyConfig"
-              @save-sub2api-sync="saveSub2APISyncConfig"
-              @sub2api-sync-changed="resetSub2APISyncSaveStatus"
             />
 
             <FormSection title="邮箱来源" density="roomy">
@@ -220,9 +208,8 @@ const registerConfigRuntime = useRegisterConfigRuntime({
 })
 const legacyLoading = registerConfigRuntime.loading
 const legacySaving = registerConfigRuntime.saving
-const sub2apiSyncSaving = registerConfigRuntime.sub2apiSyncSaving
-const sub2apiSyncSaveStatus = registerConfigRuntime.sub2apiSyncSaveStatus
-const sub2apiSyncSaveMessage = registerConfigRuntime.sub2apiSyncSaveMessage
+const autosaveStatus = registerConfigRuntime.autosaveStatus
+const autosaveMessage = registerConfigRuntime.autosaveMessage
 const registerConfig = registerConfigRuntime.config
 const registerProviders = registerConfigRuntime.providers
 const registerProxyMode = registerConfigRuntime.proxyMode
@@ -235,9 +222,6 @@ const applyRegisterRuntimeConfig = registerConfigRuntime.applyRuntimeConfig
 const loadRegisterConfig = registerConfigRuntime.loadConfig
 const loadRegisterRuntimeConfig = registerConfigRuntime.loadRuntimeConfig
 const loadProxyGroups = registerConfigRuntime.loadProxyGroups
-const saveLegacyConfig = registerConfigRuntime.saveConfig
-const saveSub2APISyncConfig = registerConfigRuntime.saveSub2APISyncConfig
-const resetSub2APISyncSaveStatus = registerConfigRuntime.resetSub2APISyncSaveStatus
 const toggleLegacyTask = registerConfigRuntime.toggleTask
 const resetLegacyStats = registerConfigRuntime.resetStats
 const setRegisterTarget = registerConfigRuntime.setTarget
@@ -307,6 +291,17 @@ const visibleRegisterProviderEntries = computed(() => registerProviders.value
 const enabledProviderIssueCount = computed(() => buildRegisterProviderIssueCount(registerProviders.value))
 const grokConfigIssueCount = computed(() => grokRequirementMessages(registerConfig.value).length)
 const sub2apiSyncIssueCount = computed(() => sub2apiSyncRequirementMessages(registerConfig.value).length)
+const autosaveLabel = computed(() => {
+  if (autosaveStatus.value === 'saving') return '自动保存中...'
+  if (autosaveStatus.value === 'pending') return '待保存'
+  if (autosaveStatus.value === 'error') return '自动保存失败'
+  return '已自动保存'
+})
+const autosaveTone = computed(() => {
+  if (autosaveStatus.value === 'error') return 'danger'
+  if (autosaveStatus.value === 'saving' || autosaveStatus.value === 'pending') return 'info'
+  return 'success'
+})
 const registerIssueCount = computed(() => (
   enabledProviderIssueCount.value + grokConfigIssueCount.value + sub2apiSyncIssueCount.value
 ))
@@ -497,7 +492,7 @@ watch(
 
 function activateRegisterView(refresh = false) {
   startGptMailClock()
-  if (refresh) {
+  if (refresh && !registerConfigRuntime.hasUnsavedChanges.value) {
     void Promise.all([loadRegisterConfig(true), loadProxyGroups()])
   }
   startLiveUpdates()
@@ -532,7 +527,7 @@ pageRuntime.onHide(() => {
 
 pageRuntime.onShow(() => {
   startGptMailClock()
-  void loadRegisterConfig(true)
+  if (!registerConfigRuntime.hasUnsavedChanges.value) void loadRegisterConfig(true)
   startLiveUpdates()
 })
 </script>

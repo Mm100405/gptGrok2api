@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import json
 import re
 import time
 from typing import Any
@@ -12,7 +13,8 @@ import aiohttp
 
 from app.platform.meta import get_project_version
 
-_UPDATE_BASE_URL = "https://pro.muyuai.top/updates"
+_GITHUB_RELEASES_API_URL = "https://api.github.com/repos/AuuCoder/gptGrok2api/releases?per_page=20"
+_GITHUB_CHANGELOG_URL = "https://raw.githubusercontent.com/AuuCoder/gptGrok2api/main/CHANGELOG.md"
 _RELEASE_PAGE_URL = "https://github.com/AuuCoder/gptGrok2api/releases"
 _CACHE_TTL_SECONDS = 86400.0
 _ERROR_TTL_SECONDS = 300.0
@@ -72,12 +74,12 @@ def _select_latest_release(releases: list[dict[str, Any]]) -> dict[str, Any] | N
 
 def _normalize_error_message(value: str) -> str:
     text = str(value or "").strip()
-    if text.startswith("Update source query failed:"):
-        status_match = re.search(r"Update source query failed:\s*(\d{3})", text)
+    if text.startswith("GitHub update query failed:"):
+        status_match = re.search(r"GitHub update query failed:\s*(\d{3})", text)
         if status_match:
-            return f"Update source query failed ({status_match.group(1)})."
-        return "Update source query failed."
-    if text == "Update source returned an empty version":
+            return f"GitHub update query failed ({status_match.group(1)})."
+        return "GitHub update query failed."
+    if text == "GitHub Releases returned no published version":
         return text
     return text or "Update check failed."
 
@@ -87,9 +89,10 @@ def _build_payload(release: dict[str, Any] | None = None, error: str = "") -> di
     release = release or {}
     latest_version = _normalize_version(str(release.get("tag_name") or release.get("name") or ""))
     release_name = str(release.get("name") or "").strip()
-    release_url = str(release.get("html_url") or "").strip()
+    release_url = str(release.get("html_url") or _RELEASE_PAGE_URL).strip()
     published_at = str(release.get("published_at") or "").strip()
     release_notes = str(release.get("body") or "").strip()
+    changelog = str(release.get("changelog") or "").strip()
     has_remote = bool(release)
     return {
         "current_version": current_version,
@@ -98,6 +101,7 @@ def _build_payload(release: dict[str, Any] | None = None, error: str = "") -> di
         "release_url": release_url,
         "published_at": published_at,
         "release_notes": release_notes,
+        "changelog": changelog,
         "update_available": has_remote and bool(latest_version) and _is_newer(latest_version, current_version),
         "checked_at": _utc_now_iso(),
         "status": "error" if error else "ok",
@@ -105,34 +109,49 @@ def _build_payload(release: dict[str, Any] | None = None, error: str = "") -> di
     }
 
 
-async def _fetch_latest_release() -> dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=10)
+async def _fetch_github_text(session: aiohttp.ClientSession, url: str, accept: str) -> str:
     headers = {
-        "Accept": "text/plain",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "gptgrok2api-update-check",
     }
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async def fetch_text(filename: str) -> str:
-            url = f"{_UPDATE_BASE_URL}/{filename}"
-            async with session.get(url, headers=headers) as response:
-                content = (await response.text()).strip()
-                if response.status != 200:
-                    raise RuntimeError(f"Update source query failed: {response.status} {content}".strip())
-                return content
+    async with session.get(url, headers=headers) as response:
+        content = (await response.text()).strip()
+        if response.status != 200:
+            raise RuntimeError(f"GitHub update query failed: {response.status} {content}".strip())
+        return content
 
-        version, changelog = await asyncio.gather(
-            fetch_text("VERSION"),
-            fetch_text("CHANGELOG.md"),
+
+async def _fetch_github_releases(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    content = await _fetch_github_text(
+        session,
+        _GITHUB_RELEASES_API_URL,
+        "application/vnd.github+json",
+    )
+    try:
+        payload = json.loads(content)
+    except ValueError as exc:
+        raise RuntimeError("GitHub Releases returned invalid JSON") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError("GitHub Releases returned an invalid payload")
+    return [item for item in payload if isinstance(item, dict)]
+
+
+async def _fetch_github_changelog(session: aiohttp.ClientSession) -> str:
+    return await _fetch_github_text(session, _GITHUB_CHANGELOG_URL, "text/plain")
+
+
+async def _fetch_latest_release() -> dict[str, Any]:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        releases, changelog = await asyncio.gather(
+            _fetch_github_releases(session),
+            _fetch_github_changelog(session),
         )
-        if not version:
-            raise RuntimeError("Update source returned an empty version")
-        return {
-            "tag_name": version,
-            "name": f"v{_normalize_version(version)}",
-            "html_url": _RELEASE_PAGE_URL,
-            "published_at": "",
-            "body": changelog,
-        }
+    latest = _select_latest_release(releases)
+    if latest is None:
+        raise RuntimeError("GitHub Releases returned no published version")
+    return {**latest, "changelog": changelog}
 
 
 async def get_latest_release_info(force: bool = False) -> dict[str, Any]:

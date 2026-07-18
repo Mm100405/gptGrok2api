@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { getAuthToken } from '@/api/client'
 import { proxyApi, type ProxyGroup } from '@/api/proxy'
 import { registerApi, type LegacyRegisterConfig } from '@/api/register'
@@ -34,6 +34,7 @@ export type RegisterConfigRuntimeInput = {
 
 const REGISTER_CONFIG_REQUEST_KEY = 'register:config'
 const PROXY_GROUPS_REQUEST_KEY = 'register:proxy-groups'
+const AUTOSAVE_DELAY_MS = 800
 const PROVIDER_RUNTIME_KEYS = [
   'mailboxes_count',
   'mailboxes_base_count',
@@ -46,14 +47,16 @@ const PROVIDER_RUNTIME_KEYS = [
 export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   const loading = ref(false)
   const saving = ref(false)
-  const sub2apiSyncSaving = ref(false)
-  const sub2apiSyncSaveStatus = ref<'idle' | 'saving' | 'success' | 'error'>('idle')
-  const sub2apiSyncSaveMessage = ref('')
+  const autosaveStatus = ref<'idle' | 'pending' | 'saving' | 'saved' | 'error'>('idle')
+  const autosaveMessage = ref('')
   const proxyGroups = ref<ProxyGroup[]>([])
   const proxyMode = ref<RegisterProxyMode>('global')
   const selectedProxyGroupId = ref('')
   const customProxyInput = ref('')
   const config = ref<LegacyRegisterConfig | null>(null)
+  let savedConfigSnapshot = ''
+  let autosaveTimer: ReturnType<typeof setTimeout> | undefined
+  let savePromise: Promise<boolean> | null = null
   const applyListeners = new Set<() => void>()
 
   const configQuery = usePageQuery({
@@ -71,6 +74,12 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   const proxyGroupOptions = computed(() => buildRegisterProxyGroupOptions(proxyGroups.value, selectedProxyGroupId.value))
   const proxyGroupGroups = computed(() => [{ options: proxyGroupOptions.value }])
   const proxyHint = computed(() => buildRegisterProxyHint(proxyMode.value))
+  const configSnapshot = (value: LegacyRegisterConfig) => JSON.stringify(legacyRegisterPayload(value))
+  const hasUnsavedChanges = computed(() => {
+    const current = config.value
+    if (!current || !savedConfigSnapshot) return false
+    return configSnapshot(current) !== savedConfigSnapshot
+  })
 
   function onConfigApplied(callback: () => void) {
     applyListeners.add(callback)
@@ -86,6 +95,9 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
 
   function applyConfig(nextConfig: LegacyRegisterConfig) {
     config.value = normalizeRegisterConfig(nextConfig)
+    savedConfigSnapshot = configSnapshot(config.value)
+    autosaveStatus.value = 'saved'
+    autosaveMessage.value = '配置已保存'
     syncProxyControlsFromValue(config.value.proxy)
     applyListeners.forEach((callback) => callback())
   }
@@ -162,6 +174,76 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     })
   }
 
+  function clearAutosaveTimer() {
+    if (autosaveTimer === undefined) return
+    clearTimeout(autosaveTimer)
+    autosaveTimer = undefined
+  }
+
+  function scheduleAutosave() {
+    clearAutosaveTimer()
+    if (!config.value || !savedConfigSnapshot || !hasUnsavedChanges.value) return
+    autosaveStatus.value = 'pending'
+    autosaveMessage.value = '等待自动保存...'
+    autosaveTimer = setTimeout(() => {
+      autosaveTimer = undefined
+      void persistConfig()
+    }, AUTOSAVE_DELAY_MS)
+  }
+
+  async function persistConfig(notify = false): Promise<boolean> {
+    clearAutosaveTimer()
+    if (!config.value || !hasUnsavedChanges.value) return true
+    if (savePromise) return savePromise
+
+    const requestSnapshot = configSnapshot(config.value)
+    saving.value = true
+    autosaveStatus.value = 'saving'
+    autosaveMessage.value = '正在自动保存...'
+    savePromise = (async () => {
+      try {
+        const response = await registerApi.updateConfig(payload())
+        const normalizedResponse = normalizeRegisterConfig(response.register)
+        if (config.value && configSnapshot(config.value) === requestSnapshot) {
+          applyConfig(normalizedResponse)
+        } else {
+          // Keep edits made while the request was in flight and use the
+          // server response as the new baseline for the next autosave.
+          savedConfigSnapshot = configSnapshot(normalizedResponse)
+          autosaveStatus.value = 'saved'
+          autosaveMessage.value = '已保存，正在同步最新修改...'
+        }
+        if (notify) input.notifySuccess('注册配置已自动保存')
+        return true
+      } catch (error: any) {
+        const message = error?.message || '自动保存注册配置失败'
+        autosaveStatus.value = 'error'
+        autosaveMessage.value = message
+        if (notify) input.notifyError(message)
+        return false
+      } finally {
+        saving.value = false
+        savePromise = null
+        if (autosaveStatus.value !== 'error' && hasUnsavedChanges.value) scheduleAutosave()
+      }
+    })()
+    return savePromise
+  }
+
+  async function flushAutosave(): Promise<boolean> {
+    clearAutosaveTimer()
+    if (savePromise) return savePromise
+    return persistConfig()
+  }
+
+  watch(
+    config,
+    () => {
+      if (config.value && savedConfigSnapshot && hasUnsavedChanges.value) scheduleAutosave()
+    },
+    { deep: true, flush: 'post' },
+  )
+
   async function loadConfig(silent = false) {
     await configQuery.run(
       () => registerApi.getConfig(),
@@ -206,48 +288,7 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
   }
 
   async function saveConfig() {
-    if (!config.value || saving.value) return
-    saving.value = true
-    try {
-      const requestPayload = payload()
-      const response = await registerApi.updateConfig(requestPayload)
-      applyConfig(response.register)
-      input.notifySuccess('注册配置已保存')
-    } catch (error: any) {
-      input.notifyError(error?.message || '保存注册配置失败')
-    } finally {
-      saving.value = false
-    }
-  }
-
-  function resetSub2APISyncSaveStatus() {
-    if (sub2apiSyncSaveStatus.value === 'saving') return
-    sub2apiSyncSaveStatus.value = 'idle'
-    sub2apiSyncSaveMessage.value = ''
-  }
-
-  async function saveSub2APISyncConfig() {
-    if (!config.value || saving.value) return
-    const syncConfig = legacyRegisterPayload(config.value).sub2api_sync
-    saving.value = true
-    sub2apiSyncSaving.value = true
-    sub2apiSyncSaveStatus.value = 'saving'
-    sub2apiSyncSaveMessage.value = '正在保存 Sub2API 同步配置...'
-    try {
-      const response = await registerApi.updateConfig({ sub2api_sync: syncConfig })
-      applyConfig(response.register)
-      sub2apiSyncSaveStatus.value = 'success'
-      sub2apiSyncSaveMessage.value = 'Sub2API 同步配置已保存'
-      input.notifySuccess('Sub2API 同步配置已保存')
-    } catch (error: any) {
-      const message = error?.message || '保存 Sub2API 同步配置失败'
-      sub2apiSyncSaveStatus.value = 'error'
-      sub2apiSyncSaveMessage.value = message
-      input.notifyError(message)
-    } finally {
-      sub2apiSyncSaving.value = false
-      saving.value = false
-    }
+    await persistConfig(true)
   }
 
   async function toggleTask() {
@@ -262,8 +303,11 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     saving.value = true
     try {
       if (starting) {
-        const requestPayload = payload()
-        await registerApi.updateConfig(requestPayload)
+        const saved = await flushAutosave()
+        if (!saved) {
+          input.notifyError('配置自动保存失败，暂未启动注册任务')
+          return
+        }
       }
       const response = starting ? await registerApi.startLegacy() : await registerApi.stopLegacy()
       applyConfig(response.register)
@@ -308,14 +352,14 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     authToken: getAuthToken,
     loading,
     saving,
-    sub2apiSyncSaving,
-    sub2apiSyncSaveStatus,
-    sub2apiSyncSaveMessage,
+    autosaveStatus,
+    autosaveMessage,
     proxyGroups,
     proxyMode,
     selectedProxyGroupId,
     customProxyInput,
     config,
+    hasUnsavedChanges,
     providers,
     proxyGroupOptions,
     proxyGroupGroups,
@@ -332,8 +376,7 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     loadRuntimeConfig,
     loadProxyGroups,
     saveConfig,
-    saveSub2APISyncConfig,
-    resetSub2APISyncSaveStatus,
+    flushAutosave,
     toggleTask,
     resetStats,
     invalidate,

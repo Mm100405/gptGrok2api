@@ -132,17 +132,6 @@
     </FormSection>
 
     <FormSection v-if="config.target === 'openai'" title="Checkout / 支付链接" density="roomy">
-      <template #actions>
-        <Button
-          size="sm"
-          variant="primary"
-          :disabled="checkoutSaving || config.enabled"
-          @click="emit('save-checkout')"
-        >
-          {{ checkoutSaving ? '保存中...' : '保存提链配置' }}
-        </Button>
-      </template>
-
       <div class="register-form-grid">
         <label class="register-toggle register-field--full">
           <Checkbox
@@ -306,14 +295,6 @@
       <template #actions>
         <Button
           size="sm"
-          variant="primary"
-          :disabled="checkoutSaving || sub2apiSyncSaving || config.enabled"
-          @click="emit('save-sub2api-sync')"
-        >
-          {{ sub2apiSyncSaving ? '保存中...' : '保存配置' }}
-        </Button>
-        <Button
-          size="sm"
           variant="outline"
           :disabled="sub2apiLoading"
           @click="refreshSub2APIConnections"
@@ -423,18 +404,6 @@
           </template>
         </template>
 
-        <p
-          v-if="sub2apiSyncSaveStatus !== 'idle'"
-          class="sub2api-sync-message register-field--full"
-          :class="{
-            'sub2api-sync-message--success': sub2apiSyncSaveStatus === 'success',
-            'sub2api-sync-message--error': sub2apiSyncSaveStatus === 'error',
-          }"
-          role="status"
-          aria-live="polite"
-        >
-          {{ sub2apiSyncSaveMessage }}
-        </p>
       </div>
     </FormSection>
 
@@ -862,10 +831,6 @@ const sub2apiGroupModeGroups = [{
 }]
 const props = defineProps<{
   config: LegacyRegisterConfig
-  checkoutSaving: boolean
-  sub2apiSyncSaving: boolean
-  sub2apiSyncSaveStatus: 'idle' | 'saving' | 'success' | 'error'
-  sub2apiSyncSaveMessage: string
   proxyMode: RegisterProxyMode
   selectedProxyGroupId: string
   customProxyInput: string
@@ -952,9 +917,6 @@ async function testCheckoutProxy(stage: CheckoutProxyTestStage) {
     checkoutProxyTestResults.value = {
       ...checkoutProxyTestResults.value,
       [stage]: result,
-    }
-    if (result.ok && result.normalized_changed) {
-      emit('save-checkout')
     }
   } catch (error: any) {
     checkoutProxyTestResults.value = {
@@ -1171,14 +1133,12 @@ function updateSub2APIServer(value: unknown) {
   props.config.sub2api_sync.server_id = serverId
   props.config.sub2api_sync.group_id = ''
   props.config.sub2api_sync.group_name = ''
-  emit('sub2api-sync-changed')
 }
 
 function updateSub2APIEnabled(value: unknown) {
   const enabled = Boolean(value)
   if (enabled === props.config.sub2api_sync.enabled) return
   props.config.sub2api_sync.enabled = enabled
-  emit('sub2api-sync-changed')
 }
 
 function updateSub2APIGroupMode(value: unknown) {
@@ -1187,21 +1147,18 @@ function updateSub2APIGroupMode(value: unknown) {
   props.config.sub2api_sync.group_mode = mode
   if (mode === 'custom') props.config.sub2api_sync.group_id = ''
   else props.config.sub2api_sync.group_name = ''
-  emit('sub2api-sync-changed')
 }
 
 function updateSub2APIRemoteGroup(value: unknown) {
   const groupId = selectValue(value)
   if (groupId === props.config.sub2api_sync.group_id) return
   props.config.sub2api_sync.group_id = groupId
-  emit('sub2api-sync-changed')
 }
 
 function updateSub2APIGroupName(value: unknown) {
   const groupName = String(value || '').trim()
   if (groupName === props.config.sub2api_sync.group_name) return
   props.config.sub2api_sync.group_name = groupName
-  emit('sub2api-sync-changed')
 }
 
 watch(
@@ -1310,9 +1267,6 @@ const continuousRetryHint = computed(() => {
 })
 
 const emit = defineEmits<{
-  (e: 'save-checkout'): void
-  (e: 'save-sub2api-sync'): void
-  (e: 'sub2api-sync-changed'): void
   (e: 'update-target', value: string): void
   (e: 'update-proxy-mode', value: string): void
   (e: 'select-proxy-group', value: string): void

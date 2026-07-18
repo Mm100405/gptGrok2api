@@ -160,6 +160,7 @@ register_checkout_retry_sink: Callable[[dict[str, Any]], None] | None = None
 # re-populate a cleared task table.
 register_checkout_task_run_id = ""
 OPENAI_EXISTING_EMAIL_RETRY_LIMIT = 20
+CF_MAILBOX_WAIT_TIMEOUT_SECONDS = 60.0
 
 
 class PasswordlessSignupUnavailable(RuntimeError):
@@ -172,6 +173,18 @@ class OpenAIEmailAlreadyRegistered(RuntimeError):
     def __init__(self, email: str) -> None:
         self.email = str(email or "").strip()
         super().__init__(f"当前邮箱已进入 OpenAI 登录验证码分支，不能作为新账号继续注册: {self.email}")
+
+
+class OpenAIMailboxDeliveryTimeout(RuntimeError):
+    """The current mailbox never received an OTP for its active challenge."""
+
+    def __init__(self, mailbox: dict[str, Any], reason: str = "") -> None:
+        self.email = str(mailbox.get("address") or "").strip()
+        self.provider = str(mailbox.get("provider") or "").strip()
+        self.provider_ref = str(mailbox.get("provider_ref") or "").strip()
+        self.label = str(mailbox.get("label") or self.provider or "邮箱来源").strip()
+        self.reason = str(reason or "未收到验证码").strip()
+        super().__init__(f"[{self.label}] {self.reason}")
 
 
 common_headers = {
@@ -737,12 +750,81 @@ def _authorize_landed_page(resp) -> str:
     return ""
 
 
-def create_mailbox(username: str | None = None, register_proxy: str = "") -> dict:
-    return mail_provider.create_mailbox(_mail_config(register_proxy), username)
+def create_mailbox(
+    username: str | None = None,
+    register_proxy: str = "",
+    excluded_provider_refs: set[str] | None = None,
+) -> dict:
+    return mail_provider.create_mailbox(
+        _mail_config(register_proxy),
+        username,
+        excluded_provider_refs=excluded_provider_refs,
+    )
 
 
-def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
-    return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox)
+def wait_for_code(
+    mailbox: dict,
+    register_proxy: str = "",
+    *,
+    wait_timeout: float | None = None,
+) -> str | None:
+    return mail_provider.wait_for_code(
+        _mail_config(register_proxy),
+        mailbox,
+        wait_timeout=wait_timeout,
+    )
+
+
+def _configured_mail_wait_timeout() -> float:
+    mail = config.get("mail") if isinstance(config.get("mail"), dict) else {}
+    try:
+        return max(1.0, float(mail.get("wait_timeout") or 30))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _wait_for_chatgpt_registration_code(
+    mailbox: dict[str, Any],
+    index: int,
+    register_proxy: str,
+    *,
+    resend: Callable[[], None] | None = None,
+) -> str:
+    is_cf_mail = str(mailbox.get("provider") or "").strip() == "cloudflare_temp_email"
+    wait_timeout = min(_configured_mail_wait_timeout(), CF_MAILBOX_WAIT_TIMEOUT_SECONDS) if is_cf_mail else None
+    if is_cf_mail:
+        step(index, f"CF 邮箱等待验证码（最多 {int(wait_timeout or CF_MAILBOX_WAIT_TIMEOUT_SECONDS)} 秒）")
+
+    def poll() -> str | None:
+        if wait_timeout is None:
+            return wait_for_code(mailbox, register_proxy=register_proxy)
+        return wait_for_code(mailbox, register_proxy=register_proxy, wait_timeout=wait_timeout)
+
+    try:
+        code = poll()
+    except Exception as error:
+        if is_cf_mail:
+            raise OpenAIMailboxDeliveryTimeout(
+                mailbox,
+                f"查询邮件失败：{type(error).__name__}: {error}",
+            ) from error
+        raise
+    if code:
+        return code
+
+    if is_cf_mail and resend is not None:
+        step(index, "CF 邮箱首次未收到验证码，正在重发一次", "yellow")
+        resend()
+        mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        step(index, f"验证码已重发，继续等待 CF 邮箱（最多 {int(wait_timeout or CF_MAILBOX_WAIT_TIMEOUT_SECONDS)} 秒）")
+        try:
+            code = poll()
+        except Exception as error:
+            raise OpenAIMailboxDeliveryTimeout(mailbox, f"重发后查询邮件失败：{type(error).__name__}: {error}") from error
+        if code:
+            return code
+
+    raise OpenAIMailboxDeliveryTimeout(mailbox, "验证码投递超时：邮箱服务未返回新邮件")
 
 
 from utils.sentinel import (
@@ -1203,9 +1285,21 @@ class PlatformRegistrar:
         self._platform_authorize_final_url = ""
         self.last_otp_continue_url = ""
         self.passwordless_signup = False
+        self.excluded_mail_provider_refs: set[str] = set()
 
     def close(self) -> None:
         self.session.close()
+
+    def _create_registration_mailbox(self) -> dict:
+        excluded = {
+            str(item or "").strip()
+            for item in getattr(self, "excluded_mail_provider_refs", set())
+            if str(item or "").strip()
+        }
+        return create_mailbox(
+            register_proxy=self.proxy,
+            excluded_provider_refs=excluded,
+        )
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = _header_fingerprint(navigate_headers, self.fingerprint)
@@ -1675,7 +1769,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox(register_proxy=self.proxy)
+        mailbox = self._create_registration_mailbox()
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -2110,7 +2204,7 @@ class ChatGPTWebRegistrar(PlatformRegistrar):
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox(register_proxy=self.proxy)
+        mailbox = self._create_registration_mailbox()
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -2129,9 +2223,12 @@ class ChatGPTWebRegistrar(PlatformRegistrar):
             mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
             self._send_chatgpt_otp(index)
             step(index, "开始等待 ChatGPT 注册验证码")
-            code = wait_for_code(mailbox, register_proxy=self.proxy)
-            if not code:
-                raise RuntimeError("等待 ChatGPT 注册验证码超时：邮箱服务未返回新邮件，请检查转发地址或更换邮箱提供商")
+            code = _wait_for_chatgpt_registration_code(
+                mailbox,
+                index,
+                self.proxy,
+                resend=lambda: self._send_chatgpt_otp(index),
+            )
             step(index, f"收到 ChatGPT 注册验证码: {code}")
             self._validate_chatgpt_otp(code, index)
             callback_url = self._create_chatgpt_profile(
@@ -2487,6 +2584,7 @@ class TraditionalChatGPTRegistrar(ChatGPTWebRegistrar):
 
     def _reference_resend_otp(self, index: int) -> None:
         """Resend an OTP without replacing the active authorize challenge."""
+        step(index, "重发 ChatGPT 注册验证码")
         sentinel_token = str(getattr(self, "_reference_authorize_sentinel", "") or "").strip()
         if not sentinel_token:
             raise RuntimeError("ChatGPT OTP 分支缺少 authorize/continue 的 Sentinel 上下文")
@@ -2529,6 +2627,7 @@ class TraditionalChatGPTRegistrar(ChatGPTWebRegistrar):
             error_message = str(data.get("message") or "unknown error").strip()
         if error_message:
             raise RuntimeError(f"ChatGPT 验证码重发请求被拒绝: {error_message}")
+        step(index, "ChatGPT 验证码重发请求已接受")
 
     def _reference_validate_otp(self, code: str, index: int) -> None:
         resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
@@ -2608,7 +2707,7 @@ class TraditionalChatGPTRegistrar(ChatGPTWebRegistrar):
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox(register_proxy=self.proxy)
+        mailbox = self._create_registration_mailbox()
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -2626,9 +2725,12 @@ class TraditionalChatGPTRegistrar(ChatGPTWebRegistrar):
                 mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                 self._reference_send_otp(index)
                 step(index, "开始等待 ChatGPT 注册验证码")
-                code = wait_for_code(mailbox, register_proxy=self.proxy)
-                if not code:
-                    raise RuntimeError("等待 ChatGPT 注册验证码超时：邮箱服务未返回新邮件，请检查转发地址或更换邮箱提供商")
+                code = _wait_for_chatgpt_registration_code(
+                    mailbox,
+                    index,
+                    self.proxy,
+                    resend=lambda: self._reference_resend_otp(index),
+                )
                 step(index, f"收到 ChatGPT 注册验证码: {code}")
                 self._reference_validate_otp(code, index)
                 continue_url = self._reference_create_account(
@@ -2656,9 +2758,12 @@ class TraditionalChatGPTRegistrar(ChatGPTWebRegistrar):
                 # authorize/continue before the mailbox polling window.
                 mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
                 step(index, "开始等待 ChatGPT 注册验证码")
-                code = wait_for_code(mailbox, register_proxy=self.proxy)
-                if not code:
-                    raise RuntimeError("等待 ChatGPT 注册验证码超时：邮箱服务未返回新邮件，请检查转发地址或更换邮箱提供商")
+                code = _wait_for_chatgpt_registration_code(
+                    mailbox,
+                    index,
+                    self.proxy,
+                    resend=lambda: self._reference_resend_otp(index),
+                )
                 step(index, f"收到 ChatGPT 注册验证码: {code}")
                 self._reference_validate_otp(code, index)
                 continue_url = self._reference_create_account(
@@ -2772,12 +2877,41 @@ def _sync_registered_account_to_sub2api(index: int, account: dict, registrar: An
         step(index, f"Sub2API 同步未成功，本地账号已保留：{safe_error}", "yellow")
 
 
+def _enabled_mail_provider_count() -> int:
+    mail = config.get("mail") if isinstance(config.get("mail"), dict) else {}
+    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+    return sum(
+        1
+        for item in providers
+        if isinstance(item, dict) and _truthy(item.get("enable"), False)
+    )
+
+
 def _register_with_fresh_email(index: int) -> tuple[TraditionalChatGPTRegistrar, dict]:
     skipped = 0
+    delivery_failures = 0
+    excluded_provider_refs: set[str] = set()
+    provider_count = max(1, _enabled_mail_provider_count())
     while True:
         registrar = TraditionalChatGPTRegistrar(config["proxy"])
+        registrar.excluded_mail_provider_refs = set(excluded_provider_refs)
         try:
             return registrar, registrar.register(index)
+        except OpenAIMailboxDeliveryTimeout as error:
+            registrar.close()
+            delivery_failures += 1
+            if error.provider_ref:
+                excluded_provider_refs.add(error.provider_ref)
+            remaining = provider_count - max(delivery_failures, len(excluded_provider_refs))
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"所有启用邮箱来源均未收到 ChatGPT 验证码，最后失败来源：{error.label}"
+                ) from error
+            step(
+                index,
+                f"{error.label} 未收到验证码，正在切换下一个邮箱来源（剩余 {remaining} 个）",
+                "yellow",
+            )
         except OpenAIEmailAlreadyRegistered as error:
             registrar.close()
             skipped += 1

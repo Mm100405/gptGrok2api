@@ -369,6 +369,7 @@ class ChatGPTWebRegistrarTest(unittest.TestCase):
                 patch.object(openai_register, "TraditionalChatGPTRegistrar", return_value=fake_registrar) as registrar_type,
                 patch.object(openai_register.account_service, "add_account_items"),
                 patch.object(openai_register.account_service, "refresh_accounts", return_value={"errors": []}),
+                patch.object(openai_register, "_checkout_config", return_value={"enabled": False}),
             ):
                 result = openai_register.worker(1)
         finally:
@@ -426,6 +427,107 @@ class ChatGPTWebRegistrarTest(unittest.TestCase):
 
         mark_mailbox_result.assert_called_once()
         self.assertFalse(mark_mailbox_result.call_args.kwargs["success"])
+
+
+class ChatGPTMailboxDeliveryTest(unittest.TestCase):
+    def test_cf_mailbox_uses_short_wait_and_resends_once(self) -> None:
+        mailbox = {
+            "address": "cf@example.test",
+            "provider": "cloudflare_temp_email",
+            "provider_ref": "cloudflare_temp_email:cf",
+            "label": "CF 邮箱",
+        }
+        resend = MagicMock()
+
+        with (
+            patch.object(openai_register, "_configured_mail_wait_timeout", return_value=180),
+            patch.object(openai_register, "wait_for_code", side_effect=[None, "123456"]) as wait_for_code,
+            patch.object(openai_register, "step"),
+        ):
+            code = openai_register._wait_for_chatgpt_registration_code(
+                mailbox,
+                1,
+                "",
+                resend=resend,
+            )
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(wait_for_code.call_count, 2)
+        self.assertEqual(wait_for_code.call_args_list[0].kwargs["wait_timeout"], 60.0)
+        self.assertEqual(wait_for_code.call_args_list[1].kwargs["wait_timeout"], 60.0)
+        resend.assert_called_once_with()
+        self.assertIn("_received_after", mailbox)
+
+    def test_cf_mailbox_second_timeout_requests_provider_fallback(self) -> None:
+        mailbox = {
+            "address": "cf@example.test",
+            "provider": "cloudflare_temp_email",
+            "provider_ref": "cloudflare_temp_email:cf",
+            "label": "CF 邮箱",
+        }
+        resend = MagicMock()
+
+        with (
+            patch.object(openai_register, "_configured_mail_wait_timeout", return_value=180),
+            patch.object(openai_register, "wait_for_code", side_effect=[None, None]),
+            patch.object(openai_register, "step"),
+            self.assertRaises(openai_register.OpenAIMailboxDeliveryTimeout) as raised,
+        ):
+            openai_register._wait_for_chatgpt_registration_code(mailbox, 1, "", resend=resend)
+
+        self.assertEqual(raised.exception.provider_ref, "cloudflare_temp_email:cf")
+        self.assertIn("投递超时", str(raised.exception))
+        resend.assert_called_once_with()
+
+    def test_non_cf_mailbox_keeps_configured_wait_without_resend(self) -> None:
+        mailbox = {
+            "address": "icloud@example.test",
+            "provider": "icloud_api",
+            "provider_ref": "icloud_api:primary",
+            "label": "iCloud",
+        }
+        resend = MagicMock()
+
+        with (
+            patch.object(openai_register, "wait_for_code", return_value="654321") as wait_for_code,
+            patch.object(openai_register, "step"),
+        ):
+            code = openai_register._wait_for_chatgpt_registration_code(mailbox, 1, "", resend=resend)
+
+        self.assertEqual(code, "654321")
+        wait_for_code.assert_called_once_with(mailbox, register_proxy="")
+        resend.assert_not_called()
+
+    def test_non_cf_query_error_keeps_the_real_provider_failure(self) -> None:
+        mailbox = {
+            "address": "outlook@example.test",
+            "provider": "outlook_token",
+            "provider_ref": "outlook_token:primary",
+            "label": "Outlook",
+        }
+        query_error = RuntimeError(
+            "graph: OutlookToken 刷新失败: HTTP 400, AADSTS70000: The grant is expired"
+        )
+        resend = MagicMock()
+
+        with (
+            patch.object(openai_register, "wait_for_code", side_effect=query_error),
+            patch.object(openai_register, "step"),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            openai_register._wait_for_chatgpt_registration_code(
+                mailbox,
+                1,
+                "",
+                resend=resend,
+            )
+
+        self.assertIs(raised.exception, query_error)
+        self.assertNotIsInstance(
+            raised.exception,
+            openai_register.OpenAIMailboxDeliveryTimeout,
+        )
+        resend.assert_not_called()
 
 
 class TraditionalChatGPTRegistrarTest(unittest.TestCase):
@@ -757,6 +859,57 @@ class TraditionalChatGPTRegistrarTest(unittest.TestCase):
 
 
 class OpenAIExistingEmailRetryTest(unittest.TestCase):
+    def test_single_enabled_provider_delivery_timeout_stops_without_looping(self) -> None:
+        failed_mailbox = {
+            "address": "cf@example.test",
+            "provider": "cloudflare_temp_email",
+            "provider_ref": "cloudflare_temp_email:cf",
+            "label": "CF 邮箱",
+        }
+        failed = MagicMock()
+        failed.register.side_effect = openai_register.OpenAIMailboxDeliveryTimeout(failed_mailbox)
+
+        with (
+            patch.object(openai_register, "_enabled_mail_provider_count", return_value=1),
+            patch.object(openai_register, "TraditionalChatGPTRegistrar", return_value=failed) as factory,
+            patch.object(openai_register, "step"),
+            self.assertRaisesRegex(RuntimeError, "所有启用邮箱来源均未收到 ChatGPT 验证码"),
+        ):
+            openai_register._register_with_fresh_email(3)
+
+        factory.assert_called_once_with(openai_register.config["proxy"])
+        failed.close.assert_called_once_with()
+
+    def test_mailbox_delivery_timeout_excludes_failed_provider_on_fresh_session(self) -> None:
+        failed_mailbox = {
+            "address": "cf@example.test",
+            "provider": "cloudflare_temp_email",
+            "provider_ref": "cloudflare_temp_email:cf",
+            "label": "CF 邮箱",
+        }
+        failed = MagicMock()
+        failed.register.side_effect = openai_register.OpenAIMailboxDeliveryTimeout(failed_mailbox)
+        fresh = MagicMock()
+        fresh.register.return_value = {"email": "fresh@example.test", "access_token": "access"}
+
+        with (
+            patch.object(openai_register, "_enabled_mail_provider_count", return_value=2),
+            patch.object(openai_register, "TraditionalChatGPTRegistrar", side_effect=[failed, fresh]),
+            patch.object(openai_register, "step") as step,
+        ):
+            registrar, result = openai_register._register_with_fresh_email(3)
+
+        self.assertIs(registrar, fresh)
+        self.assertEqual(result["email"], "fresh@example.test")
+        self.assertEqual(failed.excluded_mail_provider_refs, set())
+        self.assertEqual(
+            fresh.excluded_mail_provider_refs,
+            {"cloudflare_temp_email:cf"},
+        )
+        failed.close.assert_called_once_with()
+        fresh.close.assert_not_called()
+        self.assertTrue(any("正在切换下一个邮箱来源" in str(call) for call in step.call_args_list))
+
     def test_replaces_existing_account_email_with_fresh_registrar(self) -> None:
         existing = MagicMock()
         existing.register.side_effect = openai_register.OpenAIEmailAlreadyRegistered("used@example.test")
